@@ -1,0 +1,507 @@
+
+#define F_CPU 16000000UL		// CPU clock speed
+
+// C standard library
+#include <stdlib.h>
+
+// AVR related libraries
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <avr/power.h>
+#include <avr/sleep.h>	
+#include <ioe.c>			// personal UART library
+
+#define ARDUINO 100			// spoof Arduino libraries with board version
+#define chipSelect 10		// pin for card selection
+
+#define TRUE 1
+#define FALSE 0			
+
+#define NORMAL 0
+#define MOTION 1
+#define LAPSE 2
+#define COMBINED 3
+
+// Arduino related libraries
+#include <Arduino.h>
+
+// Software serial library
+#include <SoftwareSerial.h>
+
+// Camera libraries
+#include <Adafruit_VC0706.h>
+#include <SPI.h>
+
+// SD card library
+#include <SD.h>
+
+// create a connection through a software serial method
+SoftwareSerial cameraconnection = SoftwareSerial(5, 6); // 2, 3
+Adafruit_VC0706 cam = Adafruit_VC0706(&cameraconnection);
+
+// function prototypes
+void ADC_init();
+void cam_init();
+void init_fail();
+void init_pass();
+void cam_snap();
+
+unsigned int SDcheck = FALSE;
+unsigned int reset = TRUE;
+unsigned int menu = FALSE;
+unsigned int opMode = NORMAL;
+
+unsigned char input;
+char voltageStr[20];
+unsigned int ADCV = 0;
+float voltage = 0;		// temporary variable for holding conversion
+
+void setup() 
+{
+	if(reset)
+	{
+		UART_putStr("\033[2J");
+
+		UART_init(9600,0,0);
+		ADC_init();				// initialize ADC
+		cam_init();
+		reset = FALSE;
+	}
+}
+
+void loop() 
+{
+	/*if(input = UART_getChar())
+	{
+		opMode = NORMAL;
+		
+		switch (input)
+		{
+			case 'm':
+				menu = TRUE;
+				UART_putChar(input);
+				break;
+			case 'r':
+				menu = TRUE; reset = TRUE;
+				break;
+			case '1':
+				menu = TRUE; opMode = NORMAL;
+				UART_putChar(input);
+			case '2':
+				menu = TRUE; opMode = MOTION;
+				UART_putChar(input);
+			case '3':
+				menu = TRUE; opMode = LAPSE;
+				UART_putChar(input);
+				UART_putChar('\n');
+				UART_putChar('\r');
+				UART_putChar('\n');
+				UART_putChar('\r');
+				UART_putStr("> ");
+			default:
+				break;
+		}
+
+	}
+	
+	if(menu)
+	{
+		menu = FALSE;
+
+		UART_putStr("\033[2J");
+		setup();
+	}
+	*/
+
+	TCCR1A |= (1 << COM1A1) | (1 << WGM11) | (1 << WGM10);        //NON Inverted PWM
+	TCCR1B |= (0 << WGM13)  | (1 << WGM12)  | (1 << CS11)  | (1 << CS10); //PRESCALER=64 MODE 14(FAST PWM)
+
+	TCCR3A |= (1 << COM3A1) | (1 << COM3B1) | (1 << WGM31) | (1 << WGM30);        //NON Inverted PWM
+	TCCR3B |= (0 << WGM33)  | (1 << WGM32)  | (1 << CS31)  | (1 << CS30); //PRESCALER=64 MODE 14(FAST PWM)
+
+	TCCR4A |= (1 << COM4A1) | (1 << COM4B1) | (1 << WGM41) | (1 << WGM40);        //NON Inverted PWM
+	TCCR4B |= (0 << WGM43)  | (1 << WGM42)  | (1 << CS41)  | (1 << CS40); //PRESCALER=64 MODE 14(FAST PWM)
+	
+	DDRB |= (1 << PORTB0) | (1 << PORTB1);
+	DDRD |= (1 << PORTD0) | (1 << PORTD1) | (1 << PORTD2);
+
+	
+
+	if((cam.motionDetected() && opMode == MOTION ) ||
+	   (cam.motionDetected() && opMode == COMBINED ))
+	{
+		cam_snap();
+	}
+
+	if(opMode == LAPSE || opMode == COMBINED)
+	{
+
+		do
+		{
+			ADMUX = (0 << MUX3) | (1 << MUX2) | (0 << MUX1) | (0 << MUX0)
+			| (0 << REFS0) | (0 << REFS1);
+
+			ADCSRA |= (1 << ADSC);
+
+			while( (ADCSRA&(1<<ADIF)) == 0 );	// wait for conversion
+
+			ADCV = ADC & 0x03FF;				// grab only the 10 bits
+
+			voltage = (ADCV * 5.0 / 0x3FF);		// convert int to float
+			
+			cam_snap();
+
+			_delay_ms(60000);
+		}while(voltage > 3);
+	}
+
+	// ==================================================
+	// X-AXIS JOYSTICK
+	// ==================================================
+	ADMUX = (1 << MUX0);	// check ADC port 2
+
+	ADCSRA |= (1 << ADSC) | (0 << REFS0) | (0 << REFS1); // start conversion, relative to Vcc
+
+	while( (ADCSRA & (1 << ADIF) ) == 0 );	// wait for conversion to finish
+
+	ADCV = ADC & 1023;					// grab only the 10 bits
+
+	voltage = ( (ADCV * 5) / 1023);			// convert int to float
+	
+	/*
+	dtostrf(voltage, 4, 3, voltageStr);		// float to string
+	UART_putStr(voltageStr);				// print the voltage
+	UART_putStr(" V [X-AXIS] \n\r");		// print voltage suffix
+	Serial.println(OCR1A);					// optionally, print servo position
+	UART_putStr("\n\r");					// line break
+	*/
+
+	// x-axis servo logic
+	if(voltage < 1)			// if ADC lower than median joystick voltage
+	{
+		if(OCR1A >= 600)	// check if upper servo position maxed out
+			OCR1A = 600;	// if so, reset to max
+		else
+			OCR1A += 3;		// else, increase position by 3
+
+		_delay_ms(15);		// delay for speed reduction
+	}
+
+	else if(voltage > 3)	// else if ADC higher than median joystick voltage
+	{
+		if(OCR1A <= 150)	// check if lower servo position maxed out
+			OCR1A = 150;	// if so, reset to min
+		else
+			OCR1A -= 3;		// else, decrease position by 3
+
+		_delay_ms(15);		// delay for speed reduction
+	}
+	
+	// ==================================================
+	// Y-AXIS JOYSTICK
+	// ==================================================
+	ADMUX = 0;
+
+	ADCSRA |= (1 << ADSC) | (0 << REFS0) | (0 << REFS1);
+
+	while( (ADCSRA&(1<<ADIF)) == 0 );	// wait for conversion
+
+	ADCV = ADC & 0x03FF;				// grab only the 10 bits
+
+	voltage = (ADCV * 5.0 / 0x3FF);		// convert int to float
+
+	/*
+	dtostrf(voltage, 4, 3, voltageStr);			// convert float to int
+	UART_putStr(voltageStr);							// print theSS voltage
+	UART_putStr(" V [Y-AXIS] \n\r");				// suffix
+	Serial.println(OCR4B);
+	UART_putStr("\n\r");				// suffix
+	*/
+	
+	if(voltage < 1)
+	{
+		if(OCR3B >= 500 || OCR4B >= 500)
+		{
+			OCR3B = 500;
+			OCR4B = 500;
+		}
+		else
+		{
+			OCR3B += 3;
+			OCR4B += 3;
+		}
+		_delay_ms(15);
+		
+	}
+
+	else if(voltage > 3)
+	{
+		if(OCR3B <= 200 || OCR4B <= 200)
+		{
+			OCR3B = 200;
+			OCR4B = 200;
+		}
+		else
+		{
+			OCR3B -= 3;
+			OCR4B -= 3;
+		}
+		_delay_ms(15);
+	}
+	
+	// ==================================================
+	// JOYSTICK BUTTON
+	// ==================================================
+	ADMUX = (0 << MUX3) | (1 << MUX2) | (0 << MUX1) | (1 << MUX0)
+	| (0 << REFS0) | (0 << REFS1);
+
+	ADCSRA |= (1 << ADSC);
+
+	while( (ADCSRA&(1<<ADIF)) == 0 );	// wait for conversion
+
+	ADCV = ADC & 0x03FF;				// grab only the 10 bits
+
+	voltage = (ADCV * 5.0 / 0x3FF);		// convert int to float
+
+	/*
+	dtostrf(voltage, 4, 3, voltageStr);			// convert float to int
+	UART_putStr(voltageStr);							// print theSS voltage
+	UART_putStr(" V [BUTTON] \n\r");				// suffix
+	UART_putStr("\n\r");				// suffix
+	*/
+
+	if(voltage <= 0.039)
+	{
+		cam_snap();
+	}
+}
+
+void ADC_init()
+{
+	DDRC = 0x0;			// PORTC input
+
+	DIDR0 = 0x1;		// disable digital input on ADC0 pin
+
+	// set reference to AREF
+	ADMUX = 0;
+
+	// initialize ADC
+	ADCSRA = 0x87;		// enable ADC, system clock used for A/D conversion
+	ADCSRB = 0x0;		// free running mode
+
+	TCCR1A |= (1 << COM1A1) | (1 << WGM11) | (1 << WGM10);        //NON Inverted PWM
+	TCCR1B |= (0 << WGM13)  | (1 << WGM12)  | (1 << CS11)  | (1 << CS10); //PRESCALER=64 MODE 14(FAST PWM)
+	ICR1 = 4999;
+	TCNT1 = 0;
+
+	TCCR3A |= (1 << COM3A1) | (1 << COM3B1) | (1 << WGM31) | (1 << WGM30);        //NON Inverted PWM
+	TCCR3B |= (0 << WGM33)  | (1 << WGM32)  | (1 << CS31)  | (1 << CS30); //PRESCALER=64 MODE 14(FAST PWM)
+	ICR3 = 4999;
+	TCNT3 = 0;
+
+	TCCR4A |= (1 << COM4A1) | (1 << COM4B1) | (1 << WGM41) | (1 << WGM40);        //NON Inverted PWM
+	TCCR4B |= (0 << WGM43)  | (1 << WGM42)  | (1 << CS41)  | (1 << CS40); //PRESCALER=64 MODE 14(FAST PWM)
+	ICR4 = 4999;
+	TCNT4 = 0;
+	
+	DDRB |= (1 << PORTB0) | (1 << PORTB1);
+	DDRD |= (1 << PORTD0) | (1 << PORTD1) | (1 << PORTD2);
+
+	UART_putStr("\n\rADC initialized. \n\r");
+}
+
+void cam_init()
+{
+	_delay_ms(100);
+	OCR1A = 166;
+	_delay_ms(100);
+
+	_delay_ms(100);
+	OCR3B = 127;
+	OCR4B = 127;
+	_delay_ms(100);
+
+	_delay_ms(100);
+	OCR1A = 366;
+	_delay_ms(100);
+
+	_delay_ms(100);
+	OCR3B = 366;
+	OCR4B = 366;
+	_delay_ms(100);
+	
+	if(TCNT1 > 0)
+		UART_putStr("Servos reset.\n\r");
+
+	if (SD.begin(chipSelect) && !SDcheck)
+	{
+		UART_putStr("SD card initialized. \n\r");
+		SDcheck = TRUE;
+	}
+	else if(!SD.begin(chipSelect) && !SDcheck)
+	{
+		UART_putStr("[ERROR] SD card initialization \n\r");
+		init_fail();
+		return;
+	}
+
+	char *reply = cam.getVersion();
+	if (!cam.begin() && reply == 0) {
+		UART_putStr("[ERROR] Camera initialization \n\r");
+		init_fail();
+		return;
+	} 
+
+	else
+	{
+		cam.setImageSize(VC0706_640x480);        
+		UART_putStr("Image size: 640x480 \n\r");
+
+		_delay_ms(10);
+
+		UART_putStr("Camera initialized. \n\r");
+		init_pass();
+	}
+
+	ADMUX = (0 << MUX3) | (0 << MUX2) | (1 << MUX1) | (1 << MUX0)
+	| (0 << REFS0) | (0 << REFS1);
+
+	ADCSRA |= (1 << ADSC);
+
+	while( (ADCSRA&(1<<ADIF)) == 0 );	// wait for conversion
+
+	ADCV = ADC & 0x03FF;				// grab only the 10 bits
+
+	voltage = (ADCV * 5.0 / 0x3FF);		// convert int to float
+	// dtostrf(voltage, 4, 3, voltageStr);			// convert float to int
+
+	if(voltage > 3)
+	{
+		cam.setMotionDetect(true);           // turn it on
+		opMode = MOTION;
+
+		if(cam.getMotionDetect())
+			UART_putStr("Motion detection is ON. ");
+		else
+			UART_putStr("[ERROR] Can't retrieve motion status.");
+	}
+		
+		
+	else if(voltage <= 3)
+	{
+		cam.setMotionDetect(false);        // turn it off   (default)
+		opMode = NORMAL;
+		UART_putStr("Motion detection is OFF. ");
+	}
+
+	ADMUX = (0 << MUX3) | (1 << MUX2) | (0 << MUX1) | (0 << MUX0)
+	| (0 << REFS0) | (0 << REFS1);
+
+	ADCSRA |= (1 << ADSC);
+
+	while( (ADCSRA&(1<<ADIF)) == 0 );	// wait for conversion
+
+	ADCV = ADC & 0x03FF;				// grab only the 10 bits
+
+	voltage = (ADCV * 5.0 / 0x3FF);		// convert int to float
+	// dtostrf(voltage, 4, 3, voltageStr);			// convert float to int
+
+	if(voltage > 3)
+	{
+		UART_putStr("Continuous mode ON. \n\r");
+		
+		if(opMode == MOTION)
+			opMode = COMBINED;
+		else
+			opMode = LAPSE;
+	}
+		
+	
+	else if(voltage <= 3)
+	{
+		UART_putStr("Continuous mode OFF. \n\r");
+
+		if(opMode == MOTION)
+			opMode = MOTION;
+		else
+			opMode = NORMAL;
+	}
+		
+}
+
+void cam_snap()
+{
+		if (!cam.takePicture())
+			Serial.println("Failed to snap!");
+		else
+			Serial.println("Picture taken!");
+			
+		char filename[13];
+		strcpy(filename, "IMAGE00.JPG");
+		for (int i = 0; i < 100; i++) {
+			filename[6] = '0' + i%10;
+			filename[5] = '0' + i/10;
+			// create if does not exist, do not open existing, write, sync after write
+			if (! SD.exists(filename)) {
+				break;
+			}
+		}
+		
+		File imgFile = SD.open(filename, FILE_WRITE);
+		
+		uint16_t jpglen = cam.frameLength();
+		Serial.print(jpglen, DEC);
+		Serial.println(" byte image");
+		
+		Serial.print("Writing image to "); Serial.print(filename);
+		
+		while (jpglen > 0) {
+			// read 32 bytes at a time;
+			uint8_t *buffer;
+			uint8_t bytesToRead = min(32, jpglen); // change 32 to 64 for a speedup but may not work with all setups!
+			buffer = cam.readPicture(bytesToRead);
+			imgFile.write(buffer, bytesToRead);
+
+			jpglen -= bytesToRead;
+		}
+		imgFile.close();
+		Serial.println("...Done!");
+		cam.resumeVideo();
+  
+}
+
+void init_fail()
+{
+		DDRD |= (1 << PORTD7);
+		PORTD |= (1 << PORTD7);
+		// init complete buzzer signal
+		PORTB = (1 << PORTB0);
+		_delay_ms(1000);
+		PORTB = (0 << PORTB0);
+		_delay_ms(40);
+
+		
+}
+
+void init_pass()
+{
+		UART_putStr("\n\rInitialization process complete. \n\r\n\r");
+
+		DDRD |= (1 << PORTD4);
+		PORTD |= (1 << PORTD4);
+		// init complete buzzer signal
+		PORTB = (1 << PORTB0);
+		_delay_ms(40);
+		PORTB = (0 << PORTB0);
+		_delay_ms(40);
+		PORTB = (1 << PORTB0);
+		_delay_ms(40);
+		PORTB = (0 << PORTB0);
+		_delay_ms(40);
+		PORTB = (1 << PORTB0);
+		_delay_ms(40);
+		PORTB = (0 << PORTB0);
+		_delay_ms(40);
+		PORTD |= (0 << PORTD4);
+}
